@@ -14,7 +14,13 @@
 //     4. a flag may be late, but only by a bounded time (never stuck)
 //     5. read_data holds its value when no valid read happens
 //     6. async reset clears the outputs immediately, with no clock edge
-//     7. full / empty are never X or Z once out of reset
+//     7. full / empty / almost_full / almost_empty / overflow / underflow are
+//        never X or Z once out of reset
+//     8. overflow  == full  && write_en, underflow == empty && read_en
+//     9. almost_full / almost_empty can be late but never miss: whenever the
+//        FIFO really holds AF_MIN or more words, almost_full or full is high;
+//        whenever it holds 1 to AE_MAX words, almost_empty or empty is high.
+//        Both are also never high together with full / empty, and never stuck.
 //
 // The whole test list runs once per clock configuration (equal clocks, slow
 // drift between clocks, fast/slow in both directions, odd ratios 3:7 and 7:3,
@@ -28,7 +34,9 @@
 
 module tb_async;
 
-  localparam int DEPTH = 8;
+  localparam int DEPTH  = 8;
+  localparam int AF_MIN = 6;   // almost_full  is high for occupancy AF_MIN .. DEPTH-1
+  localparam int AE_MAX = 2;   // almost_empty is high for occupancy 1 .. AE_MAX
 
   // ---------------------------------------------------------------- DUT ----
   logic wclk = 0, rclk = 0;
@@ -37,6 +45,7 @@ module tb_async;
   logic [7:0] wd = 0;
   logic [7:0] rd;
   logic full, empty;
+  logic almost_full, almost_empty, overflow, underflow;
 
   async_FIFO dut (
     .clk_write_side     (wclk),
@@ -48,7 +57,11 @@ module tb_async;
     .write_data         (wd),
     .read_data          (rd),
     .full               (full),
-    .empty              (empty)
+    .almost_full        (almost_full),
+    .empty              (empty),
+    .almost_empty       (almost_empty),
+    .overflow           (overflow),
+    .underflow          (underflow)
   );
 
   // -------------------------------------------------------------- clocks ----
@@ -160,6 +173,7 @@ module tb_async;
   int cov_bw, cov_br, cov_d00, cov_dff;
   int cov_rst_full, cov_rst_part, cov_rst_empty, cov_rst_traffic, cov_pulse;
   int cov_stag_w, cov_stag_r, cov_clkchg;
+  int cov_af, cov_ae, cov_ovf, cov_unf, cov_af_rise, cov_ae_rise;
 
   task automatic clear_cov();
     cov_full = 0; cov_empty = 0; cov_over = 0; cov_under = 0;
@@ -168,15 +182,34 @@ module tb_async;
     cov_bw = 0; cov_br = 0; cov_d00 = 0; cov_dff = 0;
     cov_rst_full = 0; cov_rst_part = 0; cov_rst_empty = 0; cov_rst_traffic = 0; cov_pulse = 0;
     cov_stag_w = 0; cov_stag_r = 0; cov_clkchg = 0;
+    cov_af = 0; cov_ae = 0; cov_ovf = 0; cov_unf = 0; cov_af_rise = 0; cov_ae_rise = 0;
   endtask
 
   // -------------------------------------------------------- write monitor --
   bit  full_q = 0;
+  bit  af_q = 0;
   int  burst_w = 0;
 
   always @(posedge wclk) begin
     if (w_armed) begin
       if (full !== 1'b0 && full !== 1'b1) fail0("full is X or Z");
+      if (almost_full !== 1'b0 && almost_full !== 1'b1) fail0("almost_full is X or Z");
+      if (overflow !== 1'b0 && overflow !== 1'b1) fail0("overflow is X or Z");
+
+      // overflow is the illegal-request flag: a write requested while full is high
+      if (overflow !== (full && wen)) fail0("overflow does not equal full && write_en");
+      if (overflow) cov_ovf = cov_ovf + 1;
+
+      // almost_full: never together with full, never missing, never stuck
+      if (almost_full && full) fail0("almost_full and full are high together");
+      if (!almost_full && !full && model_q.size() >= AF_MIN)
+        fail0("almost_full low while FIFO holds AF_MIN or more words");
+      if (almost_full && model_q.size() < AF_MIN &&
+          ($time - tmax3(last_pop_t, wrel_t, rrel_t)) > bound_full())
+        fail0("almost_full stuck high long after words were read");
+      if (almost_full) cov_af = cov_af + 1;
+      if (almost_full && !af_q) cov_af_rise = cov_af_rise + 1;
+      af_q = almost_full;
 
       if (full) begin
         cov_full = cov_full + 1;
@@ -214,6 +247,7 @@ module tb_async;
 
   // --------------------------------------------------------- read monitor --
   bit         empty_q = 1;
+  bit         ae_q = 0;
   int         burst_r = 0;
   logic [7:0] exp_data, prev_rd = 0;
   bit         chk_pending = 0, hold_pending = 0;
@@ -223,6 +257,23 @@ module tb_async;
     hold_pending = 0;
     if (r_armed) begin
       if (empty !== 1'b0 && empty !== 1'b1) fail0("empty is X or Z");
+      if (almost_empty !== 1'b0 && almost_empty !== 1'b1) fail0("almost_empty is X or Z");
+      if (underflow !== 1'b0 && underflow !== 1'b1) fail0("underflow is X or Z");
+
+      // underflow is the illegal-request flag: a read requested while empty is high
+      if (underflow !== (empty && ren)) fail0("underflow does not equal empty && read_en");
+      if (underflow) cov_unf = cov_unf + 1;
+
+      // almost_empty: never together with empty, never missing, never stuck
+      if (almost_empty && empty) fail0("almost_empty and empty are high together");
+      if (!almost_empty && !empty && model_q.size() >= 1 && model_q.size() <= AE_MAX)
+        fail0("almost_empty low while FIFO holds 1 to AE_MAX words");
+      if (almost_empty && model_q.size() > AE_MAX &&
+          ($time - tmax3(last_push_t, wrel_t, rrel_t)) > bound_empty())
+        fail0("almost_empty stuck high long after words were written");
+      if (almost_empty) cov_ae = cov_ae + 1;
+      if (almost_empty && !ae_q) cov_ae_rise = cov_ae_rise + 1;
+      ae_q = almost_empty;
 
       if (empty) begin
         cov_empty = cov_empty + 1;
@@ -326,7 +377,7 @@ module tb_async;
     model_q.delete();
     chk_pending = 0; hold_pending = 0;     // a reset cancels the read check still waiting for its falling edge
     #1;                                   // no clock edge needed for the outputs to clear
-    if (rd !== 8'h00 || empty !== 1'b1 || full !== 1'b0)
+    if (rd !== 8'h00 || empty !== 1'b1 || full !== 1'b0 || almost_full !== 1'b0 || almost_empty !== 1'b0)
       fail0("outputs did not clear on async reset without a clock edge");
     #(hold_ps);
   endtask
@@ -335,7 +386,7 @@ module tb_async;
     @(negedge wclk);
     wrst_n = 1; rrst_n = 1;
     wrel_t = $time; rrel_t = $time;
-    prev_rd = 0; full_q = 0; empty_q = 1;
+    prev_rd = 0; full_q = 0; empty_q = 1; af_q = 0; ae_q = 0;
     w_armed = 1; r_armed = 1;
   endtask
 
@@ -568,6 +619,12 @@ module tb_async;
     `COV(cov_stag_w,      "staggered reset, write side first, not exercised")
     `COV(cov_stag_r,      "staggered reset, read side first, not exercised")
     `COV(cov_clkchg,      "clock frequency change not exercised")
+    `COV(cov_af,          "almost_full never seen high")
+    `COV(cov_ae,          "almost_empty never seen high")
+    `COV(cov_af_rise,     "almost_full never rose")
+    `COV(cov_ae_rise,     "almost_empty never rose")
+    `COV(cov_ovf,         "overflow flag never high")
+    `COV(cov_unf,         "underflow flag never high")
     if (cov_pushes < 48)
       begin holes = holes + 1; $display("  COVERAGE HOLE: too few words for the pointers to wrap"); end
     $display("  words written=%0d read=%0d | full seen=%0d empty seen=%0d | overflow attempts=%0d underflow attempts=%0d",

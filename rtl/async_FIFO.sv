@@ -9,7 +9,11 @@ module async_FIFO
     input logic [7:0] write_data,
     output logic [7:0] read_data,
     output logic full,
-    output logic empty
+    output logic almost_full,
+    output logic empty,
+    output logic almost_empty,
+    output logic overflow,
+    output logic underflow
 );
 
 logic [3:0] write_ptr;
@@ -30,6 +34,12 @@ logic [3:0] gray_read_ptr_ff2;
 logic [3:0] gray_read_ptr_reg;
 
 logic do_read;
+
+logic [3:0] difference_full;
+logic [3:0] difference_empty;
+
+logic [3:0] read_ptr_sync_bin;
+logic [3:0] write_ptr_sync_bin;
 
 logic [7:0] mem [0:7];
 
@@ -96,6 +106,18 @@ end
 
 assign full  = (gray_write_ptr[3:2] == ~gray_read_ptr_ff2[3:2]) && (gray_write_ptr[1:0] == gray_read_ptr_ff2[1:0]); 
 assign empty = (gray_write_ptr_ff2 == gray_read_ptr); 
+
+assign read_ptr_sync_bin  = {gray_read_ptr_ff2[3],  ^gray_read_ptr_ff2[3:2],  ^gray_read_ptr_ff2[3:1],  ^gray_read_ptr_ff2[3:0]};
+assign write_ptr_sync_bin = {gray_write_ptr_ff2[3], ^gray_write_ptr_ff2[3:2], ^gray_write_ptr_ff2[3:1], ^gray_write_ptr_ff2[3:0]};
+
+assign difference_full  = write_ptr - read_ptr_sync_bin;
+assign difference_empty = write_ptr_sync_bin - read_ptr;
+
+assign almost_full  = (~full && difference_full > 4'd5);
+assign almost_empty = (~empty && difference_empty < 4'd3);
+
+assign overflow   = (full && write_en);
+assign underflow = (empty && read_en);
 
 assign do_write = write_en && ~full;
 assign do_read  = read_en && ~empty;
