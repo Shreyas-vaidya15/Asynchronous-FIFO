@@ -1,4 +1,12 @@
 module async_FIFO
+#
+(
+    parameter int DATA_WIDTH = 32,
+    parameter int MEM_DEPTH = 32,
+    parameter int ALMOST_EMPTY = MEM_DEPTH / 4,
+    parameter int ALMOST_FULL = MEM_DEPTH - MEM_DEPTH / 4
+)
+
 (
     input logic clk_write_side,
     input logic clk_read_side,
@@ -6,8 +14,8 @@ module async_FIFO
     input logic reset_n_read_side,
     input logic write_en,
     input logic read_en,
-    input logic [7:0] write_data,
-    output logic [7:0] read_data,
+    input logic [DATA_WIDTH - 1:0] write_data,
+    output logic [DATA_WIDTH - 1:0] read_data,
     output logic full,
     output logic almost_full,
     output logic empty,
@@ -15,33 +23,50 @@ module async_FIFO
     output logic overflow,
     output logic underflow
 );
+localparam int ADDRESS_WIDTH = $clog2(MEM_DEPTH);
 
-logic [3:0] write_ptr;
+localparam int FULL_LOW_MSB = (ADDRESS_WIDTH > 1) ? ADDRESS_WIDTH - 2 : 0;
 
-logic [3:0] gray_write_ptr;
-logic [3:0] gray_write_ptr_ff1;
-logic [3:0] gray_write_ptr_ff2;
-logic [3:0] gray_write_ptr_reg;
+// synthesis translate_off
+initial begin
+    if (MEM_DEPTH < 4 || (MEM_DEPTH & (MEM_DEPTH - 1)) != 0) begin
+        $error("MEM_DEPTH must be a power of 2 and >= 4, got %0d", MEM_DEPTH);
+        $finish;
+    end
+    if (ALMOST_EMPTY < 1 || ALMOST_FULL >= MEM_DEPTH || ALMOST_EMPTY >= ALMOST_FULL) begin
+        $error("Bad thresholds: ALMOST_EMPTY=%0d ALMOST_FULL=%0d MEM_DEPTH=%0d",
+               ALMOST_EMPTY, ALMOST_FULL, MEM_DEPTH);
+        $finish;
+    end
+end
+
+// synthesis translate_on
+logic [ADDRESS_WIDTH:0] write_ptr;
+
+logic [ADDRESS_WIDTH:0] gray_write_ptr;
+logic [ADDRESS_WIDTH:0] gray_write_ptr_ff1;
+logic [ADDRESS_WIDTH:0] gray_write_ptr_ff2;
+logic [ADDRESS_WIDTH:0] gray_write_ptr_reg;
 
 logic do_write;
 
 
-logic [3:0] read_ptr;
+logic [ADDRESS_WIDTH:0] read_ptr;
 
-logic [3:0] gray_read_ptr;
-logic [3:0] gray_read_ptr_ff1;
-logic [3:0] gray_read_ptr_ff2;
-logic [3:0] gray_read_ptr_reg;
+logic [ADDRESS_WIDTH:0] gray_read_ptr;
+logic [ADDRESS_WIDTH:0] gray_read_ptr_ff1;
+logic [ADDRESS_WIDTH:0] gray_read_ptr_ff2;
+logic [ADDRESS_WIDTH:0] gray_read_ptr_reg;
 
 logic do_read;
 
-logic [3:0] difference_full;
-logic [3:0] difference_empty;
+logic [ADDRESS_WIDTH:0] difference_full;
+logic [ADDRESS_WIDTH:0] difference_empty;
 
-logic [3:0] read_ptr_sync_bin;
-logic [3:0] write_ptr_sync_bin;
+logic [ADDRESS_WIDTH:0] read_ptr_sync_bin;
+logic [ADDRESS_WIDTH:0] write_ptr_sync_bin;
 
-logic [7:0] mem [0:7];
+logic [DATA_WIDTH - 1:0] mem [0:MEM_DEPTH - 1];
 
 assign gray_write_ptr = write_ptr ^ (write_ptr >> 1'b1);
 assign gray_read_ptr  = read_ptr  ^ (read_ptr  >> 1'b1);
@@ -104,23 +129,30 @@ begin
 
 end
 
-assign full  = (gray_write_ptr[3:2] == ~gray_read_ptr_ff2[3:2]) && (gray_write_ptr[1:0] == gray_read_ptr_ff2[1:0]); 
+assign full  = (gray_write_ptr[ADDRESS_WIDTH:ADDRESS_WIDTH - 1] == ~gray_read_ptr_ff2[ADDRESS_WIDTH:ADDRESS_WIDTH - 1]) 
+               && (gray_write_ptr[FULL_LOW_MSB:0] == gray_read_ptr_ff2[FULL_LOW_MSB:0]);
 assign empty = (gray_write_ptr_ff2 == gray_read_ptr); 
-
-assign read_ptr_sync_bin  = {gray_read_ptr_ff2[3],  ^gray_read_ptr_ff2[3:2],  ^gray_read_ptr_ff2[3:1],  ^gray_read_ptr_ff2[3:0]};
-assign write_ptr_sync_bin = {gray_write_ptr_ff2[3], ^gray_write_ptr_ff2[3:2], ^gray_write_ptr_ff2[3:1], ^gray_write_ptr_ff2[3:0]};
 
 assign difference_full  = write_ptr - read_ptr_sync_bin;
 assign difference_empty = write_ptr_sync_bin - read_ptr;
 
-assign almost_full  = (~full && difference_full > 4'd5);
-assign almost_empty = (~empty && difference_empty < 4'd3);
+assign almost_full  = (~full && difference_full >= ALMOST_FULL);
+assign almost_empty = (~empty && difference_empty <= ALMOST_EMPTY);
 
 assign overflow   = (full && write_en);
 assign underflow = (empty && read_en);
 
 assign do_write = write_en && ~full;
 assign do_read  = read_en && ~empty;
+
+always_comb
+begin
+    for (int i = 0; i <= ADDRESS_WIDTH; i++)
+    begin
+        read_ptr_sync_bin[i]  = ^(gray_read_ptr_ff2  >> i);
+        write_ptr_sync_bin[i] = ^(gray_write_ptr_ff2 >> i);
+    end
+end
 
 always_ff @(posedge clk_write_side or negedge reset_n_write_side)
 begin
@@ -142,7 +174,7 @@ always_ff @(posedge clk_write_side)
 begin
     if(do_write)
     begin
-        mem[write_ptr[2:0]] <= write_data;
+        mem[write_ptr[ADDRESS_WIDTH - 1:0]] <= write_data;
     end
 end
 
@@ -161,7 +193,7 @@ begin
     if(do_read)
     begin
         read_ptr <= read_ptr + 1'b1;
-        read_data <= mem[read_ptr[2:0]];
+        read_data <= mem[read_ptr[ADDRESS_WIDTH - 1:0]];
     end
 
 end
